@@ -1,0 +1,7 @@
+{
+  "watches": [
+    {"id": "watch-a", "zip": "00000", "trim_code": "MY_PR_RWD", "prefer_drivetrain": "RWD", "payment": "Cash", "condition": "new", "search_within": "All Deliverable"},
+    {"id": "watch-b", "zip": "99999", "trim_code": "MY_PR_AWD", "prefer_drivetrain": "AWD", "payment": "Cash", "condition": "new", "search_within": "All Deliverable"}
+  ],
+  "email": {"enabled": false}
+}

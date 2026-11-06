@@ -1,0 +1,9 @@
+*.py[cod]
+__pycache__/
+.venv/
+.env*
+private*.json
+*.har
+*.eml
+*.png
+*.jpg
