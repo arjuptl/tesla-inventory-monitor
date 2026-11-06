@@ -129,3 +129,51 @@ def test_navigation_403_latches():
     page = SimpleNamespace(goto=lambda *args, **kwargs: SimpleNamespace(status=403))
     with pytest.raises(Blocked):
         navigate(page, "https://example.invalid/")
+
+
+def test_private_diagnostics_and_coarse_fields(config, tmp_path):
+    from datetime import datetime
+    result = Result("BLOCKED", stage="navigate", reason="HTTP_403",
+                    http_status=403, elapsed_ms=42)
+    public = execute(config, tmp_path, lambda *_: result, None)
+    path = tmp_path / "diagnostics.json"
+    rows = json.loads(path.read_text())
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert len(rows) == len(config.watches)
+    for row, summary in zip(rows, public["watches"]):
+        assert datetime.fromisoformat(row.pop("timestamp")).tzinfo is not None
+        assert row == summary
+    assert rows[0]["stage"] == "navigate"
+    assert rows[0]["reason"] == "HTTP_403"
+    assert rows[0]["http_status"] == 403
+    assert rows[0]["elapsed_ms"] == 42
+    assert rows[1]["status"] == "BLOCKED_LATCHED"
+    assert rows[1]["stage"] is None
+    assert all(secret not in path.read_text() for secret in config.secrets)
+
+
+def test_main_final_json_after_browser_noise(config, tmp_path, monkeypatch, capfd):
+    import os
+    from unittest.mock import MagicMock
+    from inventory_monitor import browser_ui
+    monkeypatch.setattr("inventory_monitor.runner.private_directory", lambda: tmp_path)
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", MagicMock())
+    def run(*_):
+        os.write(1, b"private browser output\n")
+        os.write(2, b"private browser error\n")
+        return Result("BLOCKED", stage="readiness", reason="BODY_TEXT_SIGNAL",
+                      http_status=200, elapsed_ms=9)
+    monkeypatch.setattr(browser_ui, "run_watch", run)
+    assert main([]) == 1
+    captured = capfd.readouterr()
+    summary = json.loads(captured.out)
+    assert captured.err == ""
+    assert "private browser" not in captured.out
+    assert summary["watches"][0]["reason"] == "BODY_TEXT_SIGNAL"
+    assert summary["watches"][0]["stage"] == "readiness"
+    assert summary["watches"][0]["http_status"] == 200
+    assert (tmp_path / "blocked.json").exists()
+    assert main([]) == 1
+    assert json.loads(capfd.readouterr().out)["watches"][0]["status"] == "BLOCKED_LATCHED"
+    assert main(["--resume-blocked"]) == 1
+    assert json.loads(capfd.readouterr().out)["watches"][0]["status"] == "BLOCKED"

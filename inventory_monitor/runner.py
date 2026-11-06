@@ -1,5 +1,6 @@
 """Coarse stdout only. Browser/library output is suppressed at the FD boundary."""
 import argparse
+from datetime import datetime, timezone
 from contextlib import contextmanager
 import json
 import os
@@ -44,10 +45,29 @@ def execute(config, private, run_watch, playwright):
     dedupe = Dedupe(private / "dedupe.json")
     latched = latch.exists()
     summaries, details = [], []
+
+    def summary(label, status, result=None):
+        # Explicit field selection: never serialize matches or arbitrary exceptions.
+        stages = {"launch", "navigate", "check_block_after_nav", "configure_location",
+                  "configure_filters", "readiness", "parse_cards", "detail_eligibility"}
+        reasons = {"HTTP_403", "HTTP_429", "HTTP_OTHER_BLOCK", "CHALLENGE_IFRAME",
+                   "BODY_TEXT_SIGNAL", "UNKNOWN_BLOCK"}
+        stage = getattr(result, "stage", None)
+        reason = getattr(result, "reason", None)
+        http = getattr(result, "http_status", None)
+        elapsed = getattr(result, "elapsed_ms", None)
+        return {"id_hash_or_generic_label": label, "status": status,
+                "stage": stage if stage in stages else None,
+                "reason": reason if reason in reasons else None,
+                "http_status": http if type(http) is int and 100 <= http <= 599 else None,
+                "elapsed_ms": elapsed if type(elapsed) is int and elapsed >= 0 else None,
+                "card_count": result.card_count if result else 0,
+                "match_count": len(result.matches) if result else 0, "blocked": latched}
+
     for index, watch in enumerate(config.watches, 1):
         label = f"watch-{index}"
         if latched:
-            summaries.append({"id_hash_or_generic_label": label, "status": "BLOCKED_LATCHED", "card_count": 0, "match_count": 0, "blocked": True})
+            summaries.append(summary(label, "BLOCKED_LATCHED"))
             continue
         try:
             result = run_watch(playwright, watch)
@@ -57,10 +77,13 @@ def execute(config, private, run_watch, playwright):
                 private_write(latch, {"blocked": True})
             events = [{"card": card.to_dict(), "event": dedupe.event(card)} for card in result.matches]
             details.append({"watch": label, "status": status, "matches": events})
-            summaries.append({"id_hash_or_generic_label": label, "status": status, "card_count": result.card_count, "match_count": len(result.matches), "blocked": latched})
+            summaries.append(summary(label, status, result))
         except Exception:
             # Do not print arbitrary exception strings: these can contain private URLs.
-            summaries.append({"id_hash_or_generic_label": label, "status": "ERROR", "card_count": 0, "match_count": 0, "blocked": latched})
+            summaries.append(summary(label, "ERROR"))
+    private_write(private / "diagnostics.json", [
+        {**row, "timestamp": datetime.now(timezone.utc).isoformat()} for row in summaries
+    ])
     private_write(private / "results.json", details)
     dedupe.save()
     ok = all(row["status"] in {"LOADED_EMPTY", "LOADED_WITH_CARDS"} for row in summaries)

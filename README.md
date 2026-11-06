@@ -30,7 +30,9 @@ Candidate details require an explicit positive registration eligibility statemen
 
 ## Privacy and failure behavior
 
-Never commit real configuration. Workflow logs are public: the runner emits only generic watch labels, status enums, counts, a boolean, and a fixed note. It suppresses browser/library stdout and stderr, never prints raw exceptions, and includes a tested redaction helper for any future diagnostic logging. Do not enable verbose/debug/trace logging or echo the environment secret in workflows.
+Never commit real configuration. Workflow logs are public: the runner emits only generic watch labels, status enums, stage/reason enums, top-level navigation http_status, elapsed_ms, counts, a boolean, and a fixed note. It suppresses browser/library stdout and stderr, never prints raw exceptions, and includes a tested redaction helper for any future diagnostic logging. Do not enable verbose/debug/trace logging or echo the environment secret in workflows.
+
+Public Actions summaries include `stage`, `reason`, and `http_status`. Coarse diagnostics with ISO timestamps are saved as `diagnostics.json` only under `RUN_PRIVATE_DIR`. Live cloud behavior remains unverified; there is no schedule.
 
 Detailed matches and dedupe hashes are written only under `RUN_PRIVATE_DIR` (default `/tmp/inventory-monitor-private`), with owner-only permissions. The runner rejects output inside the repository. Never upload this directory as an artifact, commit it, or expose it through logs. No screenshots, HARs, email files, or browser storage are retained. Profiles live under the OS temporary directory and are disposable. No artifacts are uploaded by the workflow.
 
@@ -40,6 +42,6 @@ A challenge writes `blocked.json` into the private directory and stops remaining
 
 ## Offline tests and sanitization
 
-Create a virtual environment outside the repository, install `requirements-dev.txt`, and run `PYTHONDONTWRITEBYTECODE=1 python -m pytest` from this directory. Tests use fictional HTML and mocks only; they never contact Tesla. Run `python scripts/sanitize.py` before publication. Its denylist is supplied as encoded fingerprints so this repository does not embed prohibited private identifiers. It scans all bytes and paths, rejects symlinks, generated caches, unexpected files, contact email addresses, and non-placeholder ZIP literals. It is a defense against known leaks, not proof that arbitrary free text contains no personal information. This repository was authored from scratch without reading private configuration.
+Create a virtual environment outside the repository, install `requirements-dev.txt`, and run `PYTHONDONTWRITEBYTECODE=1 python -m pytest` from this directory. Tests use fictional HTML and mocks only; they never contact Tesla. The visibility fixtures require locally installed Playwright Chromium (`playwright install chromium`) and inject HTML into an offline blank page. Stage tests use mocked controls; no live Tesla DOM was available. Run `python scripts/sanitize.py` before publication. Its denylist is supplied as encoded fingerprints so this repository does not embed prohibited private identifiers. It scans all bytes and paths, rejects symlinks, generated caches, unexpected files, contact email addresses, and non-placeholder ZIP literals. It is a defense against known leaks, not proof that arbitrary free text contains no personal information. This repository was authored from scratch without reading private configuration.
 
 `MANIFEST.md` records file sizes and local verification results. No repository initialization or publication is performed by this package.

@@ -2,6 +2,7 @@
 import re
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from tempfile import TemporaryDirectory
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
@@ -11,8 +12,20 @@ CARDS = "article.inventory-result, .inventory-results article, [data-testid='inv
 BLOCK = re.compile(r"access denied|verify (?:that )?you are human|unusual traffic|captcha|security challenge|request blocked|403 forbidden", re.I)
 EMPTY = re.compile(r"\bno (?:vehicles|results|inventory)(?: found| available| match)|\b0 vehicles\b", re.I)
 
+class BlockReason(str, Enum):
+    HTTP_403 = "HTTP_403"
+    HTTP_429 = "HTTP_429"
+    HTTP_OTHER_BLOCK = "HTTP_OTHER_BLOCK"
+    CHALLENGE_IFRAME = "CHALLENGE_IFRAME"
+    BODY_TEXT_SIGNAL = "BODY_TEXT_SIGNAL"
+    UNKNOWN_BLOCK = "UNKNOWN_BLOCK"
+
+
 class Blocked(Exception):
-    pass
+    def __init__(self, reason=BlockReason.UNKNOWN_BLOCK, http_status=None):
+        self.reason = reason.value if isinstance(reason, BlockReason) else reason
+        self.http_status = http_status
+        super().__init__(self.reason)
 
 class Unverified(Exception):
     pass
@@ -22,21 +35,34 @@ class Result:
     status: str
     card_count: int = 0
     matches: list = field(default_factory=list)
+    stage: str | None = None
+    reason: str | None = None
+    http_status: int | None = None
+    elapsed_ms: int | None = None
 
 
 def check_block(page):
+    # Playwright inner_text omits non-visible nodes (hidden/display:none/template/script bodies).
+    # That is the intentional anti-false-positive boundary; do not scan raw HTML source.
     if BLOCK.search(page.locator("body").inner_text(timeout=2000)):
-        raise Blocked
+        raise Blocked(BlockReason.BODY_TEXT_SIGNAL)
     if page.locator("iframe[title*='challenge' i]:visible, iframe[title*='captcha' i]:visible").count():
-        raise Blocked
+        raise Blocked(BlockReason.CHALLENGE_IFRAME)
 
 
-def navigate(page, url):
+def navigate(page, url, *, check=True):
     response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
     # Only top-level navigation status; no network listeners or response-body access.
     if response and response.status in {403, 429}:
-        raise Blocked
-    check_block(page)
+        raise Blocked(BlockReason.HTTP_403 if response.status == 403 else BlockReason.HTTP_429,
+                      response.status)
+    if check:
+        try:
+            check_block(page)
+        except Blocked as error:
+            error.http_status = response.status if response else None
+            raise
+    return response.status if response else None
 
 
 def choose(page, name):
@@ -58,7 +84,8 @@ def selected(page, name):
     return False
 
 
-def configure(page, watch):
+def configure(page, watch, record_stage=lambda stage: None):
+    record_stage("configure_location")
     check_block(page)
     location = page.get_by_role("button", name=re.compile(r"location|delivery zip|registration zip", re.I))
     if location.count() != 1:
@@ -83,6 +110,8 @@ def configure(page, watch):
     else:
         zip_input.press("Enter")
     dialog.wait_for(state="hidden", timeout=5000)
+    record_stage("configure_filters")
+    check_block(page)
     choose(page, "New")
     choose(page, "Cash")
     choose(page, watch.trim)
@@ -131,22 +160,43 @@ def eligibility(text, zip_code):
 
 
 def run_watch(playwright, watch):
+    started = time.monotonic()
+    stage = "launch"
+    http_status = None
+
+    def record_stage(value):
+        nonlocal stage
+        stage = value
+
+    def result(status, count=0, matches=None, block=None):
+        return Result(status, count, matches or [], stage=stage,
+                      reason=block.reason if block else None,
+                      http_status=block.http_status if block and block.http_status is not None else http_status,
+                      elapsed_ms=int((time.monotonic() - started) * 1000))
+
     # A fresh disposable profile per watch is stricter than per-run isolation.
     with TemporaryDirectory(prefix="inventory-monitor-profile-") as profile:
-        context = playwright.chromium.launch_persistent_context(
-            user_data_dir=profile, headless=True, accept_downloads=False,
-        )
-        context.set_default_timeout(5000)
-        page = context.new_page()
+        context = None
+        page = None
         try:
-            navigate(page, BASE)
-            configure(page, watch)
+            context = playwright.chromium.launch_persistent_context(
+                user_data_dir=profile, headless=True, accept_downloads=False,
+            )
+            context.set_default_timeout(5000)
+            page = context.new_page()
+            record_stage("navigate")
+            http_status = navigate(page, BASE, check=False)
+            record_stage("check_block_after_nav")
+            check_block(page)
+            configure(page, watch, record_stage)
+            record_stage("readiness")
             status = readiness(page)
             if status in {"LOADED_EMPTY", "LOADED_WITH_CARDS"}:
                 if not all(selected(page, name) for name in ("New", "Cash", watch.trim)):
                     raise Unverified
             if status != "LOADED_WITH_CARDS":
-                return Result(status)
+                return result(status)
+            record_stage("parse_cards")
             nodes = page.locator(CARDS).filter(visible=True)
             count = nodes.count()
             candidates = []
@@ -160,7 +210,9 @@ def run_watch(playwright, watch):
                     candidates.append(card)
             matches = []
             for card in candidates[:20]:
-                navigate(page, card.href)
+                record_stage("detail_eligibility")
+                http_status = None
+                http_status = navigate(page, card.href)
                 deadline = time.monotonic() + 10
                 while time.monotonic() < deadline:
                     check_block(page)
@@ -173,18 +225,19 @@ def run_watch(playwright, watch):
                         matches.append(card)
                         break
                     page.wait_for_timeout(250)
-            return Result("CANDIDATE_LIMIT" if len(candidates) > 20 else status, count, matches)
-        except Blocked:
-            return Result("BLOCKED")
+            return result("CANDIDATE_LIMIT" if len(candidates) > 20 else status, count, matches)
+        except Blocked as block:
+            return result("BLOCKED", block=block)
         except Exception as error:
             try:
                 check_block(page)
-            except Blocked:
-                return Result("BLOCKED")
+            except Blocked as block:
+                return result("BLOCKED", block=block)
             except Exception:
                 pass
             if isinstance(error, PlaywrightTimeout):
-                return Result("TIMEOUT")
-            return Result("UI_UNVERIFIED" if isinstance(error, Unverified) else "ERROR")
+                return result("TIMEOUT")
+            return result("UI_UNVERIFIED" if isinstance(error, Unverified) else "ERROR")
         finally:
-            context.close()
+            if context is not None:
+                context.close()
